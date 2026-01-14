@@ -7,31 +7,46 @@ funding_url: https://github.com/GrayXu/OpenWebUI-Funcs
 """
 
 import asyncio
+import contextvars
 import re
+from dataclasses import dataclass
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Callable, Awaitable
 
 
 class Filter:
+    @dataclass
+    class _StreamState:
+        reasoning_buffer: str = ""
+        scan_pos: int = 0
+        last_summary: str = ""
+        event_emitter: Optional[Callable[[dict], Awaitable[None]]] = None
+        finished_emitted: bool = False
+        in_reasoning: bool = False
+
     class Valves(BaseModel):
         priority: int = Field(default=100, description="priority")
 
     def __init__(self):
         self.valves = self.Valves()
-        self._reasoning_buffer = ""
-        self._scan_pos = 0
-        self._last_summary = ""
         self._bold_line_re = re.compile(r"\*\*(.+?)\*\*")
-        self._event_emitter = None
-        self._finished_emitted = False
-        self._in_reasoning = False
+        self._state_ctx = contextvars.ContextVar(
+            "gemini_think_summary_state", default=None
+        )
 
     async def inlet(
         self, body: dict, __event_emitter__, __user__: Optional[dict] = None
     ) -> dict:
-        self._event_emitter = __event_emitter__
-        self._finished_emitted = False
-        self._in_reasoning = False
+        self._state_ctx.set(
+            self._StreamState(
+                reasoning_buffer="",
+                scan_pos=0,
+                last_summary="",
+                event_emitter=__event_emitter__,
+                finished_emitted=False,
+                in_reasoning=False,
+            )
+        )
         return body
 
     def _collect_reasoning_chunk(self, event: dict) -> str:
@@ -45,11 +60,11 @@ class Filter:
                 chunk += message["reasoning_content"]
         return chunk
 
-    def _extract_new_summary(self) -> Optional[str]:
-        if self._scan_pos >= len(self._reasoning_buffer):
+    def _extract_new_summary(self, state: _StreamState) -> Optional[str]:
+        if state.scan_pos >= len(state.reasoning_buffer):
             return None
 
-        segment = self._reasoning_buffer[self._scan_pos :]
+        segment = state.reasoning_buffer[state.scan_pos :]
         lines = segment.splitlines(keepends=True)
         if not lines:
             return None
@@ -66,10 +81,10 @@ class Filter:
             if match:
                 newest = match.group(1).strip()
 
-        self._scan_pos += consumed
+        state.scan_pos += consumed
 
-        if newest and newest != self._last_summary:
-            self._last_summary = newest
+        if newest and newest != state.last_summary:
+            state.last_summary = newest
             return newest
 
         return None
@@ -80,8 +95,10 @@ class Filter:
         # No-op in outlet; this filter only monitors streaming reasoning content.
         return body
 
-    def _emit_status(self, summary: str, finished: bool = False) -> None:
-        if not self._event_emitter:
+    def _emit_status(
+        self, state: _StreamState, summary: str, finished: bool = False
+    ) -> None:
+        if not state.event_emitter:
             return
         description = summary if finished else f"🤔 {summary}..."
         payload = {
@@ -93,14 +110,17 @@ class Filter:
             },
         }
         try:
-            asyncio.create_task(self._event_emitter(payload))
+            asyncio.create_task(state.event_emitter(payload))
         except RuntimeError:
             return
 
     def stream(self, event: dict) -> dict:
+        state = self._state_ctx.get()
+        if state is None:
+            state = self._StreamState()
         reasoning_chunk = self._collect_reasoning_chunk(event)
         if not reasoning_chunk:
-            if self._in_reasoning and not self._finished_emitted:
+            if state.in_reasoning and not state.finished_emitted:
                 has_content = False
                 for choice in event.get("choices", []):
                     delta = choice.get("delta") or {}
@@ -112,13 +132,13 @@ class Filter:
                         has_content = True
                         break
                 if has_content:
-                    self._emit_status("😎 Thinking Finished", finished=True)
-                    self._finished_emitted = True
+                    self._emit_status(state, "😎 Thinking Finished", finished=True)
+                    state.finished_emitted = True
             return event
 
-        self._reasoning_buffer += reasoning_chunk
-        self._in_reasoning = True
-        summary = self._extract_new_summary()
+        state.reasoning_buffer += reasoning_chunk
+        state.in_reasoning = True
+        summary = self._extract_new_summary(state)
         if summary:
-            self._emit_status(summary)
+            self._emit_status(state, summary)
         return event
